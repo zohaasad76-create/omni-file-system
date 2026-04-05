@@ -1,0 +1,245 @@
+
+#include <iostream>
+#include <fstream>
+#include <cassert>
+#include <filesystem>
+#include <string>
+#include <cstring>
+#include <vector>
+#include <ctime>
+#include "ofs_core.hpp"
+#include "../include/ofs_types.hpp"
+#include "ofs_instance.hpp"
+#include "meta_entry.hpp"
+
+static const char* default_uconf_content =
+"[filesystem]\n"
+"total_size = 104857600\n"
+"header_size = 512\n"
+"block_size = 4096\n"
+"max_files = 1000\n"
+"\n"
+"[security]\n"
+"max_users = 50\n"
+"admin_username = \"admin\"\n"
+"admin_password = \"admin123\"\n";
+static bool ensure_dir_exists(const std::string& dir) {
+    std::error_code ec;
+    if (!std::filesystem::exists(dir, ec)) {
+        if (!std::filesystem::create_directories(dir, ec)) {
+            std::cerr << "ERROR: could not create directory: " << dir << " (" << ec.message() << ")\n";
+            return false;
+        }
+    }
+    return true;
+}
+static bool ensure_file_with_contents(const std::string& file_path, const std::string& contents) {
+    std::error_code ec;
+    std::filesystem::path p(file_path);
+    auto parent = p.parent_path();
+    if (!parent.empty() && !std::filesystem::exists(parent, ec)) {
+        if (!std::filesystem::create_directories(parent, ec)) {
+            std::cerr << "ERROR: could not create directory: " << parent << " (" << ec.message() << ")\n";
+            return false;
+        }
+    }
+    if (!std::filesystem::exists(file_path, ec)) {
+        std::ofstream out(file_path, std::ios::binary);
+        if (!out) {
+            std::cerr << "ERROR: could not create file: " << file_path << "\n";
+            return false;
+        }
+        out << contents;
+        out.close();
+    }
+    return true;
+}
+static void check_or_abort(int res, const char* msg) {
+    if (res != 0) {
+        std::cerr << msg << " -> " << get_error_message(res) << " (" << res << ")\n";
+        std::abort();
+    } else {
+        std::cout << msg << " -> Success\n";
+    }
+}
+
+int main() {
+    const char* omni_path = "compiled/sample.omni";
+    const char* config_path = "compiled/default.uconf";
+    if (!ensure_dir_exists("compiled")) return 1;
+    if (!ensure_file_with_contents(config_path, default_uconf_content)) return 1;
+    std::cout << "=== START: Comprehensive OFS function test ===\n";
+    std::cout << "Formatting filesystem...\n";
+    int res = fs_format(omni_path, config_path);
+    std::cout << "fs_format: " << get_error_message(res) << "\n";
+    check_or_abort(res, "fs_format");
+    std::cout << "Initializing filesystem...\n";
+    void* instance = nullptr;
+    res = fs_init(&instance, omni_path, config_path);
+    std::cout << "fs_init: " << get_error_message(res) << "\n";
+    check_or_abort(res, "fs_init");
+    (void)instance; 
+    std::cout << "Logging in as admin...\n";
+    void* admin_session = nullptr;
+    res = user_login(&admin_session, "admin", "admin123");
+    std::cout << "user_login(admin): " << get_error_message(res) << "\n";
+    check_or_abort(res, "user_login(admin)");
+    std::cout << "Listing users (admin)...\n";
+    UserInfo* users = nullptr;
+    int user_count = 0;
+    res = user_list(admin_session, &users, &user_count);
+    std::cout << "user_list: " << get_error_message(res) << " count=" << user_count << "\n";
+    check_or_abort(res, "user_list");
+    if (users && user_count > 0) {
+        for (int i = 0; i < user_count; ++i) {
+            std::cout << " - user[" << i << "]: username='" << users[i].username << "' active=" << (int)users[i].is_active << "\n";
+        }
+        free_buffer(users); users = nullptr;
+    }
+    std::cout << "Creating user 'alice'...\n";
+    res = user_create(admin_session, "alice", "alice_pass", UserRole::NORMAL);
+    std::cout << "user_create(alice): " << get_error_message(res) << "\n";
+    check_or_abort(res, "user_create(alice)");
+    std::cout << "Logging in as alice...\n";
+    void* alice_session = nullptr;
+    res = user_login(&alice_session, "alice", "alice_pass");
+    std::cout << "user_login(alice): " << get_error_message(res) << "\n";
+    check_or_abort(res, "user_login(alice)");
+    std::cout << "Retrieving session info for alice...\n";
+    SessionInfo info;
+    res = get_session_info(alice_session, &info);
+    std::cout << "get_session_info: " << get_error_message(res) << "\n";
+    check_or_abort(res, "get_session_info");
+    std::cout << "Session user: " << info.user.username << " login_time=" << info.login_time << "\n";
+    std::cout << "Creating directory /docs (alice)...\n";
+    res = dir_create(alice_session, "/docs");
+    std::cout << "dir_create(/docs): " << get_error_message(res) << "\n";
+    check_or_abort(res, "dir_create(/docs)");
+    res = dir_exists(alice_session, "/docs");
+    std::cout << "dir_exists(/docs): " << get_error_message(res) << "\n";
+    check_or_abort(res, "dir_exists(/docs)");
+    res = file_exists(alice_session, "/docs/test.txt");
+    std::cout << "file_exists(/docs/test.txt) before create: " << get_error_message(res) << "\n";
+    if (res == 0) {
+        std::cout << "Unexpected: file already exists before create\n";
+    }
+    const char* content = "hello ofs hi  ";
+    res = file_create(alice_session, "/docs/test.txt", content, std::strlen(content));
+    std::cout << "file_create: " << get_error_message(res) << "\n";
+    check_or_abort(res, "file_create(/docs/test.txt)");
+    res = file_exists(alice_session, "/docs/test.txt");
+    std::cout << "file_exists(/docs/test.txt) after create: " << get_error_message(res) << "\n";
+    check_or_abort(res, "file_exists after create");
+    std::cout << "Listing /docs...\n";
+    FileEntry* entries = nullptr;
+    int entry_count = 0;
+    res = dir_list(alice_session, "/docs", &entries, &entry_count);
+    std::cout << "dir_list: " << get_error_message(res) << " count=" << entry_count << "\n";
+    check_or_abort(res, "dir_list /docs");
+    if (entries && entry_count > 0) {
+        for (int i = 0; i < entry_count; ++i) {
+            std::cout << " - entry[" << i << "]: " << entries[i].name << " type=" << (int)entries[i].type << " size=" << entries[i].size << "\n";
+        }
+        free_buffer(entries); entries = nullptr;
+    }
+    std::cout << "Reading /docs/test.txt...\n";
+    char* read_buf = nullptr;
+    size_t read_size = 0;
+    res = file_read(alice_session, "/docs/test.txt", &read_buf, &read_size);
+    std::cout << "file_read: " << get_error_message(res) << " size=" << read_size << "\n";
+    check_or_abort(res, "file_read");
+    if (read_buf) {
+        std::string txt(read_buf, read_size);
+        std::cout << "Contents: '" << txt << "'\n";
+        free_buffer(read_buf); read_buf = nullptr;
+    }
+    const char* edit1 = "OFS EDIT";
+    std::cout << "Editing /docs/test.txt at index 5...\n";
+    res = file_edit(alice_session, "/docs/test.txt", edit1, std::strlen(edit1), 5);
+    std::cout << "file_edit: " << get_error_message(res) << "\n";
+    check_or_abort(res, "file_edit");
+    res = file_read(alice_session, "/docs/test.txt", &read_buf, &read_size);
+    std::cout << "file_read after edit: " << get_error_message(res) << " size=" << read_size << "\n";
+    check_or_abort(res, "file_read after edit");
+    if (read_buf) { std::cout << "Contents after edit: '" << std::string(read_buf, read_size) << "'\n"; free_buffer(read_buf); read_buf = nullptr; }
+    std::cout << "Truncating /docs/test.txt to 10 bytes...\n";
+    res = file_truncate(alice_session, "/docs/test.txt", 10);
+    std::cout << "file_truncate (shrink): " << get_error_message(res) << "\n";
+    check_or_abort(res, "file_truncate shrink");
+    res = file_read(alice_session, "/docs/test.txt", &read_buf, &read_size);
+    std::cout << "file_read after truncate (shrink): " << get_error_message(res) << " size=" << read_size << "\n";
+    check_or_abort(res, "file_read after truncate shrink");
+    if (read_buf) { std::cout << "Contents truncated: '" << std::string(read_buf, read_size) << "'\n"; free_buffer(read_buf); read_buf = nullptr; }
+    std::cout << "Expanding /docs/test.txt to 100 bytes (zero-filled)...\n";
+    res = file_truncate(alice_session, "/docs/test.txt", 100);
+    std::cout << "file_truncate (expand): " << get_error_message(res) << "\n";
+    check_or_abort(res, "file_truncate expand");
+    res = file_read(alice_session, "/docs/test.txt", &read_buf, &read_size);
+    std::cout << "file_read after truncate (expand): " << get_error_message(res) << " size=" << read_size << "\n";
+    check_or_abort(res, "file_read after truncate expand");
+    if (read_buf) { std::cout << "First 64 bytes after expand: '" << std::string(read_buf, std::min<size_t>(read_size, 64)) << "'\n"; free_buffer(read_buf); read_buf = nullptr; }
+    std::cout << "Renaming /docs/test.txt to /docs/test2.txt...\n";
+    res = file_rename(alice_session, "/docs/test.txt", "/docs/test2.txt");
+    std::cout << "file_rename: " << get_error_message(res) << "\n";
+    check_or_abort(res, "file_rename");
+    res = file_exists(alice_session, "/docs/test.txt");
+    std::cout << "file_exists old (/docs/test.txt): " << get_error_message(res) << "\n";
+    res = file_exists(alice_session, "/docs/test2.txt");
+    std::cout << "file_exists new (/docs/test2.txt): " << get_error_message(res) << "\n";
+    check_or_abort(res, "file_exists new");
+    FileMetadata meta;
+    res = get_metadata(alice_session, "/docs/test2.txt", &meta);
+    std::cout << "get_metadata: " << get_error_message(res) << "\n";
+    check_or_abort(res, "get_metadata");
+    std::cout << "Metadata path: " << meta.path << " size=" << meta.entry.size << " blocks_used=" << meta.blocks_used << "\n";
+    std::cout << "Setting permissions for /docs/test2.txt to 0644...\n";
+    res = set_permissions(alice_session, "/docs/test2.txt", 0644);
+    std::cout << "set_permissions: " << get_error_message(res) << "\n";
+    check_or_abort(res, "set_permissions");
+    FSStats stats;
+    res = get_stats(alice_session, &stats);
+    std::cout << "get_stats: " << get_error_message(res) << "\n";
+    check_or_abort(res, "get_stats");
+    std::cout << "FS total_size=" << stats.total_size << " used_space=" << stats.used_space << " free_space=" << stats.free_space
+              << " total_files=" << stats.total_files << " total_dirs=" << stats.total_directories << " total_users=" << stats.total_users << "\n";
+    std::cout << "Attempting to delete non-empty /docs (expected to fail)...\n";
+    res = dir_delete(alice_session, "/docs");
+    std::cout << "dir_delete(non-empty): " << get_error_message(res) << "\n";
+    std::cout << "Deleting /docs/test2.txt...\n";
+    res = file_delete(alice_session, "/docs/test2.txt");
+    std::cout << "file_delete: " << get_error_message(res) << "\n";
+    check_or_abort(res, "file_delete /docs/test2.txt");
+    std::cout << "Deleting /docs (now empty)...\n";
+    res = dir_delete(alice_session, "/docs");
+    std::cout << "dir_delete: " << get_error_message(res) << "\n";
+    check_or_abort(res, "dir_delete /docs");
+    std::cout << "Deleting user 'alice' (admin privilege)...\n";
+    res = user_delete(admin_session, "alice");
+    std::cout << "user_delete(alice): " << get_error_message(res) << "\n";
+    check_or_abort(res, "user_delete(alice)");
+    users = nullptr; user_count = 0;
+    res = user_list(admin_session, &users, &user_count);
+    std::cout << "user_list after delete: " << get_error_message(res) << " count=" << user_count << "\n";
+    check_or_abort(res, "user_list after delete");
+    if (users && user_count > 0) {
+        for (int i = 0; i < user_count; ++i) {
+            std::cout << " - user[" << i << "]: '" << users[i].username << "' active=" << (int)users[i].is_active << "\n";
+        }
+        free_buffer(users); users = nullptr;
+    }
+    std::cout << "Logging out alice session...\n";
+    res = user_logout(alice_session);
+    std::cout << "user_logout(alice): " << get_error_message(res) << "\n";
+    check_or_abort(res, "user_logout(alice)");
+    std::cout << "Logging out admin...\n";
+    res = user_logout(admin_session);
+    std::cout << "user_logout(admin): " << get_error_message(res) << "\n";
+    check_or_abort(res, "user_logout(admin)");
+    std::cout << "Shutting down filesystem...\n";
+    res = fs_shutdown(instance);
+    std::cout << "fs_shutdown: " << get_error_message(res) << "\n";
+    check_or_abort(res, "fs_shutdown");
+
+    std::cout << "=== ALL TESTS COMPLETED SUCCESSFULLY ===\n";
+    return 0;
+}
